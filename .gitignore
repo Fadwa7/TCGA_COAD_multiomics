@@ -6,9 +6,9 @@ data/processed/
 .RData
 .Rproj.user/
 *.Rproj
-
+.RDataTmp
 # R Markdown output
-*.html
+
 *.pdf
 
 # System files
