@@ -5,6 +5,7 @@
 **Data** : TCGA-COAD - 271 patients, RNA-seq + DNA methylation (450k)
 
 ---
+**[View the full interactive report](https://fadwa7.github.io/TCGA_COAD_multiomics/)**
 
 ## What is multiomics ?
 
