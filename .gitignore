@@ -1,0 +1,15 @@
+# Data - too large for GitHub
+data/processed/
+
+# R temporary files
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# R Markdown output
+*.html
+*.pdf
+
+# System files
+.DS_Store

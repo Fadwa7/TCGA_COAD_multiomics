@@ -1,0 +1,517 @@
+---
+title: "Multiomics integration of colorectal cancer - TCGA-COAD"
+author: "Fadwa EL KHADDAR"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    toc_depth: 3
+    code_folding: show
+    highlight: tango
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+```
+
+---
+
+# 1. Introduction
+
+## What is multiomics ?
+
+Biology does not happen at a single molecular level. A tumor cell is simultaneously shaped by its epigenome, its transcriptome, and its proteome. Each layer captures a different aspect of cellular state - and none of them alone tells the full story.
+
+**Multiomics integration** aims to find shared molecular patterns across these layers simultaneously. In cancer, this approach is particularly powerful because tumor heterogeneity is driven by alterations at multiple levels at once.
+
+## What is MOFA+ ?
+
+**MOFA+** (Multi-Omics Factor Analysis, version 2) is an unsupervised statistical framework that learns a set of **latent factors** from multiple omics datasets simultaneously. Each factor represents a compressed biological signal shared - to varying degrees - across modalities.
+
+```
+RNA-seq (3000 genes)       \
+                            --> MOFA+ --> 15 latent factors
+Methylation (3000 CpG)     /
+```
+
+Each factor has two components :
+
+- **Scores** : one value per patient - how strongly each patient expresses that factor
+- **Weights** : one value per feature - how much each gene or CpG contributes to that factor
+
+## Biological question
+
+> Which shared molecular patterns between DNA methylation and gene expression distinguish early-stage colorectal tumors (stage I-II) from advanced tumors (stage III-IV) in the TCGA-COAD cohort ?
+
+---
+
+# 2. Setup
+
+## Libraries
+
+```{r libraries}
+library(curatedTCGAData)
+library(MultiAssayExperiment)
+library(TCGAutils)
+library(DESeq2)
+library(minfi)
+library(matrixStats)
+library(MOFA2)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(gridExtra)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(gprofiler2)
+library(tidyverse)
+
+set.seed(42)
+```
+
+---
+
+# 3. Data
+
+## Download
+
+We use `curatedTCGAData` to access TCGA-COAD data directly from Bioconductor. This package provides pre-processed, compressed data ready for analysis - avoiding the need to download large raw files from the GDC portal.
+
+```{r download, eval=FALSE}
+coad <- curatedTCGAData(
+  diseaseCode = "COAD",
+  assays      = c("RNASeq2GeneNorm_illuminahiseq", "Methylation_methyl450"),
+  dry.run     = FALSE,
+  version     = "2.0.1"
+)
+```
+
+```{r load-data, echo=FALSE}
+# If already downloaded, load from cache
+coad <- curatedTCGAData(
+  diseaseCode = "COAD",
+  assays      = c("RNASeq2GeneNorm_illuminahiseq", "Methylation_methyl450"),
+  dry.run     = FALSE,
+  version     = "2.0.1"
+)
+```
+
+```{r show-coad}
+coad
+```
+
+## Clinical data
+
+We initially considered MSI (microsatellite instability) status as our primary clinical variable. However, it was available for only 90 out of 313 patients - insufficient for robust analysis. We therefore chose **overall survival** as the primary endpoint, and **tumor stage** (early vs advanced) as the secondary validation variable.
+
+```{r clinical}
+clinical_raw <- as.data.frame(colData(coad))
+
+clinical_surv <- clinical_raw %>%
+  dplyr::mutate(
+    patient_id = substr(rownames(clinical_raw), 1, 12),
+    status = dplyr::case_when(
+      vital_status.x == "1" ~ 1,
+      vital_status.x == "0" ~ 0,
+      TRUE                  ~ NA_real_
+    ),
+    time_days = dplyr::case_when(
+      status == 1 ~ as.numeric(days_to_death.x),
+      status == 0 ~ as.numeric(days_to_last_followup.x),
+      TRUE        ~ NA_real_
+    ),
+    stage_bin = dplyr::case_when(
+      pathologic_stage %in%
+        c("stage i", "stage ia", "stage ii",
+          "stage iia", "stage iib", "stage iic")   ~ "early",
+      pathologic_stage %in%
+        c("stage iii", "stage iiia", "stage iiib",
+          "stage iiic", "stage iv", "stage iva",
+          "stage ivb")                              ~ "advanced",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  dplyr::select(patient_id, status, time_days, stage_bin) %>%
+  dplyr::filter(!is.na(status), !is.na(time_days), time_days > 0)
+
+cat("Patients with complete survival data :", nrow(clinical_surv), "\n")
+cat("Vital status :\n")
+print(table(clinical_surv$status))
+cat("Tumor stage :\n")
+print(table(clinical_surv$stage_bin, useNA = "always"))
+cat("Median follow-up :", round(median(clinical_surv$time_days) / 365, 1), "years\n")
+```
+
+## Omics matrices and preprocessing
+
+```{r matrices}
+rna_mat  <- assay(coad[["COAD_RNASeq2GeneNorm_illuminahiseq-20160128"]])
+meth_mat <- assay(coad[["COAD_Methylation_methyl450-20160128"]])
+
+cat("RNA-seq raw :", nrow(rna_mat),  "genes x", ncol(rna_mat),  "samples\n")
+cat("Methylation :", nrow(meth_mat), "CpG x",   ncol(meth_mat), "samples\n")
+```
+
+### Primary tumor selection
+
+TCGA samples include primary tumors, normal tissue, recurrent tumors, and metastases. We keep only primary solid tumors (tissue code `01`) to ensure biological homogeneity.
+
+```{r primary-tumors}
+keep_primary_tumor <- function(mat) {
+  tissue_code      <- substr(colnames(mat), 14, 15)
+  mat_01           <- mat[, tissue_code == "01", drop = FALSE]
+  colnames(mat_01) <- substr(colnames(mat_01), 1, 12)
+  mat_01           <- mat_01[, !duplicated(colnames(mat_01)), drop = FALSE]
+  return(mat_01)
+}
+
+rna_tumor  <- keep_primary_tumor(rna_mat)
+meth_tumor <- keep_primary_tumor(meth_mat)
+
+cat("RNA  primary tumors :", ncol(rna_tumor),  "patients\n")
+cat("Meth primary tumors :", ncol(meth_tumor), "patients\n")
+```
+
+### Patient alignment and dimension reduction
+
+```{r alignment}
+overlap_final <- Reduce(intersect, list(
+  colnames(rna_tumor),
+  colnames(meth_tumor),
+  clinical_surv$patient_id
+))
+cat("Final overlap :", length(overlap_final), "patients\n")
+
+rna_final  <- rna_tumor[,  overlap_final]
+meth_final <- meth_tumor[, overlap_final]
+clin_final <- clinical_surv[match(overlap_final, clinical_surv$patient_id), ]
+
+cat("Same order RNA / Methylation :",
+    all(colnames(rna_final) == colnames(meth_final)), "\n")
+cat("Same order RNA / Clinical    :",
+    all(colnames(rna_final) == clin_final$patient_id), "\n")
+```
+
+We retain the **3000 most variable features** per modality. Variable features carry the biological signal; stable features are mostly noise.
+
+```{r dim-reduction}
+# RNA-seq : top 3000 most variable genes
+vars_rna <- rowVars(rna_final)
+rna_top  <- rna_final[order(vars_rna, decreasing = TRUE)[1:3000], ]
+
+# Methylation : remove CpG with > 20% missing values, then top 3000
+na_frac    <- rowMeans(is.na(meth_final))
+meth_clean <- meth_final[na_frac < 0.2, ]
+vars_meth  <- rowVars(meth_clean, na.rm = TRUE)
+meth_top   <- meth_clean[order(vars_meth, decreasing = TRUE)[1:3000], ]
+
+cat("RNA reduced :", nrow(rna_top), "genes x", ncol(rna_top), "patients\n")
+cat("Meth reduced :", nrow(meth_top), "CpG x", ncol(meth_top), "patients\n")
+```
+
+---
+
+# 4. MOFA+ model
+
+## Training
+
+```{r mofa-train, eval=FALSE}
+mofa_data <- list(
+  RNA         = as.matrix(rna_top),
+  Methylation = as.matrix(meth_top)
+)
+
+mofa <- create_mofa(mofa_data)
+
+model_opts             <- get_default_model_options(mofa)
+model_opts$num_factors <- 15
+
+train_opts                  <- get_default_training_options(mofa)
+train_opts$convergence_mode <- "slow"
+train_opts$seed             <- 42
+
+mofa <- prepare_mofa(
+  mofa,
+  data_options     = get_default_data_options(mofa),
+  model_options    = model_opts,
+  training_options = train_opts
+)
+
+mofa <- run_mofa(mofa, use_basilisk = TRUE)
+saveRDS(mofa, "data/processed/mofa_model.rds")
+```
+
+```{r mofa-load, echo=FALSE}
+mofa <- readRDS("data/processed/mofa_model.rds")
+```
+
+```{r mofa-summary}
+mofa
+```
+
+## Variance explained
+
+```{r variance-per-factor, fig.cap="Variance explained by each factor per modality. Darker color = stronger signal."}
+plot_variance_explained(mofa, max_r2 = 15)
+```
+
+**Reading the heatmap :**
+
+- **Factor1** : dominant in methylation (~15%) - strong epigenetic signal, not yet shared with transcriptomics
+- **Factor5** : significant in both modalities simultaneously - this is the shared signal we are looking for
+- **Factors 7-15** : minimal variance explained - mostly noise
+
+```{r variance-total, fig.cap="Total variance explained per modality across all 15 factors."}
+plot_variance_explained(mofa, plot_total = TRUE)
+```
+
+- **Methylation** : ~47% - highly structured, consistent with the known epigenetic heterogeneity of colorectal cancer
+- **RNA-seq** : ~13% - expected for transcriptomics, which is noisier
+
+---
+
+# 5. Clinical validation
+
+## Factor scores extraction
+
+```{r factor-scores}
+factors_raw           <- get_factors(mofa, factors = "all")[[1]]
+factors_df            <- as.data.frame(factors_raw)
+factors_df$patient_id <- rownames(factors_df)
+
+clin_mofa <- clin_final %>%
+  dplyr::inner_join(factors_df, by = "patient_id")
+
+cat("Patients in analysis :", nrow(clin_mofa), "\n")
+```
+
+## Overall survival - Cox regression
+
+We test whether each factor predicts overall survival using univariate Cox regression.
+
+```{r cox}
+results_cox <- data.frame()
+
+for (f in paste0("Factor", 1:15)) {
+  formula <- as.formula(paste("Surv(time_days, status) ~", f))
+  cox_fit  <- coxph(formula, data = clin_mofa)
+  cox_sum  <- summary(cox_fit)
+  results_cox <- rbind(results_cox, data.frame(
+    Factor  = f,
+    HR      = round(cox_sum$coefficients[, "exp(coef)"], 3),
+    p_value = round(cox_sum$coefficients[, "Pr(>|z|)"],  4)
+  ))
+}
+
+results_cox <- results_cox[order(results_cox$p_value), ]
+knitr::kable(results_cox, caption = "Univariate Cox regression results - all 15 factors")
+```
+
+**Interpretation :** No factor reaches p < 0.05. With only 74 death events in 271 patients, statistical power is insufficient for survival analysis. Factor4 shows the strongest trend (p = 0.065, HR = 0.924 - 7.6% lower death risk per unit increase). This is common in multiomics : individual factors are rarely perfect survival predictors. We switch to tumor stage as a more robust validation endpoint.
+
+## Tumor stage - Wilcoxon test
+
+**Biological question :** Which MOFA+ factors distinguish early (stage I-II) from advanced (stage III-IV) tumors ?
+
+```{r wilcoxon}
+clin_stage <- clin_mofa %>%
+  dplyr::filter(!is.na(stage_bin))
+
+cat("Patients with known stage :", nrow(clin_stage), "\n")
+print(table(clin_stage$stage_bin))
+
+results_stage <- data.frame()
+
+for (f in paste0("Factor", 1:15)) {
+  test  <- wilcox.test(clin_stage[[f]] ~ clin_stage$stage_bin)
+  means <- tapply(clin_stage[[f]], clin_stage$stage_bin, mean)
+  results_stage <- rbind(results_stage, data.frame(
+    Factor        = f,
+    mean_early    = round(means["early"],    3),
+    mean_advanced = round(means["advanced"], 3),
+    p_value       = round(test$p.value,      4)
+  ))
+}
+
+results_stage <- results_stage[order(results_stage$p_value), ]
+knitr::kable(results_stage,
+             caption = "Wilcoxon test - factor scores by tumor stage")
+```
+
+**7 factors reach p < 0.05 :**
+
+- **Higher in advanced tumors** : Factor14, Factor3, Factor9, Factor6, Factor10 - increase with progression
+- **Higher in early tumors** : Factor5 (p = 0.003, most significant), Factor12 - decrease with progression
+
+## Visualization
+
+```{r boxplots, fig.cap="MOFA+ Factor5 and Factor6 scores by tumor stage. Green = early (stage I-II), red = advanced (stage III-IV)."}
+p1 <- ggplot(clin_stage, aes(x = stage_bin, y = Factor5,
+                              fill = stage_bin)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 1) +
+  scale_fill_manual(values = c("early" = "#2ECC71", "advanced" = "#E74C3C")) +
+  labs(title = "MOFA+ Factor5 by tumor stage",
+       subtitle = "Wilcoxon p = 0.003",
+       x = "Tumor stage", y = "Factor5 score") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+p2 <- ggplot(clin_stage, aes(x = stage_bin, y = Factor6,
+                              fill = stage_bin)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 1) +
+  scale_fill_manual(values = c("early" = "#2ECC71", "advanced" = "#E74C3C")) +
+  labs(title = "MOFA+ Factor6 by tumor stage",
+       subtitle = "Wilcoxon p = 0.032",
+       x = "Tumor stage", y = "Factor6 score") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+**Factor5** shows a clear separation - early tumors have a positive median score, advanced tumors a negative median score. The boxes barely overlap, indicating a strong and consistent biological signal.
+
+**Factor6** shows a weaker separation with high outliers in the advanced group, suggesting a heterogeneous signal present in a molecular subgroup of advanced tumors rather than a uniform signature.
+
+---
+
+# 6. Biological interpretation - Factor5
+
+## RNA-seq weights
+
+```{r rna-weights}
+weights_rna <- get_weights(mofa, views = "RNA", factors = "Factor5")[[1]]
+
+top_rna_pos <- head(sort(weights_rna[, 1], decreasing = TRUE),  20)
+top_rna_neg <- head(sort(weights_rna[, 1], decreasing = FALSE), 20)
+
+cat("Top 20 genes HIGH in early tumors (positive weights):\n")
+print(top_rna_pos)
+
+cat("\nTop 20 genes HIGH in advanced tumors (negative weights):\n")
+print(top_rna_neg)
+```
+
+**Early tumors** are dominated by ribosomal protein genes (RPL/RPS family) - a signature of active and coordinated translation machinery, characteristic of well-differentiated functional cells.
+
+**Advanced tumors** show overexpression of MYH9/MYH14 (cell motility), PRKDC (DNA repair and genomic instability), RNF43 (Wnt pathway deregulation), and HNF4A (loss of intestinal differentiation) - a dedifferentiation and invasion signature.
+
+## DNA methylation weights and annotation
+
+```{r meth-weights}
+weights_meth <- get_weights(mofa, views = "Methylation", factors = "Factor5")[[1]]
+
+top_meth_pos <- head(sort(weights_meth[, 1], decreasing = TRUE),  20)
+top_meth_neg <- head(sort(weights_meth[, 1], decreasing = FALSE), 20)
+```
+
+```{r cpg-annotation}
+anno_450k <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+cols_keep <- c("UCSC_RefGene_Name", "Relation_to_Island", "UCSC_RefGene_Group")
+
+anno_pos <- as.data.frame(anno_450k[names(top_meth_pos), cols_keep])
+anno_neg <- as.data.frame(anno_450k[names(top_meth_neg), cols_keep])
+
+cat("CpG hypermethylated in EARLY tumors :\n")
+knitr::kable(anno_pos,
+             caption = "CpG probes with highest positive weights in Factor5 (early tumors)")
+```
+
+Key genes : **XKR6** (apoptosis regulator, 5 probes at TSS/1stExon), **FZD10** (Wnt receptor), **ZSCAN18** (transcription factor)
+
+```{r cpg-advanced}
+cat("CpG hypermethylated in ADVANCED tumors :\n")
+knitr::kable(anno_neg,
+             caption = "CpG probes with highest negative weights in Factor5 (advanced tumors)")
+```
+
+Key genes : **NF1** (major tumor suppressor), **HOXD10** (differentiation - loss linked to invasion), **TJP2** (tight junction protein - loss of cell cohesion), **BAG3** (apoptosis regulator)
+
+---
+
+# 7. Functional enrichment
+
+We use `gprofiler2` to identify biological pathways enriched in Factor5 gene sets. Gene lists are defined using a 2 standard deviation threshold on Factor5 weights - more statistically rigorous than an arbitrary top-N cutoff.
+
+```{r enrichment}
+seuil          <- 2 * sd(weights_rna[, 1])
+genes_early    <- names(weights_rna[weights_rna[, 1] >  seuil, 1])
+genes_advanced <- names(weights_rna[weights_rna[, 1] < -seuil, 1])
+
+cat("Genes early (2SD)    :", length(genes_early), "\n")
+cat("Genes advanced (2SD) :", length(genes_advanced), "\n")
+
+gost_early <- gost(
+  query             = genes_early,
+  organism          = "hsapiens",
+  sources           = c("GO:BP", "KEGG", "REAC"),
+  significant       = TRUE,
+  correction_method = "fdr"
+)
+
+gost_advanced <- gost(
+  query             = genes_advanced,
+  organism          = "hsapiens",
+  sources           = c("GO:BP", "KEGG", "REAC"),
+  significant       = TRUE,
+  correction_method = "fdr"
+)
+```
+
+```{r enrich-plot-early, fig.cap="Functional enrichment - genes overexpressed in early tumors (Factor5 positive weights)."}
+gostplot(gost_early, interactive = FALSE, capped = TRUE)
+```
+
+```{r enrich-table-early}
+knitr::kable(
+  head(gost_early$result[,
+    c("term_name", "p_value", "term_size", "intersection_size")], 10),
+  caption = "Top 10 enriched pathways - early tumor genes"
+)
+```
+
+**Cytoplasmic translation** (p = 10⁻¹⁰⁰) is the most significantly enriched pathway - a strong and homogeneous signal reflecting the coordinated ribosomal program of early-stage differentiated cells.
+
+```{r enrich-plot-advanced, fig.cap="Functional enrichment - genes overexpressed in advanced tumors (Factor5 negative weights)."}
+gostplot(gost_advanced, interactive = FALSE, capped = TRUE)
+```
+
+```{r enrich-table-advanced}
+knitr::kable(
+  head(gost_advanced$result[,
+    c("term_name", "p_value", "term_size", "intersection_size")], 10),
+  caption = "Top 10 enriched pathways - advanced tumor genes"
+)
+```
+
+Advanced tumor genes are enriched in morphogenesis, macromolecule localization, and cellular remodeling pathways - consistent with the invasive and migratory behavior of late-stage colorectal cancer.
+
+---
+
+# 8. Conclusion
+
+Factor5, identified by MOFA+ without any prior knowledge of tumor stage, captures a biologically coherent transition between two cellular states in colorectal cancer :
+
+| | Early tumors | Advanced tumors |
+|---|---|---|
+| **RNA signature** | Ribosomal genes (RPL/RPS) | Motility genes (MYH9, MYH14) |
+| **Methylation** | FZD10, XKR6 hypermethylated | NF1, HOXD10, TJP2 hypermethylated |
+| **Pathways** | Cytoplasmic translation (p = 10⁻¹⁰⁰) | Morphogenesis, cell localization |
+| **Biology** | Active, differentiated cells | Dedifferentiated, invasive cells |
+
+This multiomics signature is consistent with known mechanisms of colorectal cancer progression and demonstrates the value of joint analysis across molecular layers to uncover biologically interpretable patterns.
+
+---
+
+# 9. Session info
+
+```{r session-info}
+sessionInfo()
+```
